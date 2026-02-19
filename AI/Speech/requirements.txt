@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+assemblyai
+sounddevice
+numpy
+librosa

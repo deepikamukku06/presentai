@@ -1,0 +1,5 @@
+API_KEY_ASSEMBLYAI = "1e042cbaf3cc4e07b90edf4bfccc878d"
+
+
+
+GEMINI_API_KEY="AIzaSyATuwVbqttmGjoTnSoSGtuAxTWs_1vTrXg"
