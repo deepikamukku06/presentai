@@ -609,7 +609,7 @@ const Report = () => {
   );
 };
 
-const ImprovementItem = ({ icon, tip }: { icon: React.ReactNode; tip: string }) => (
+const ImprovementItem: React.FC<{ icon: React.ReactNode; tip: string }> = ({ icon, tip }) => (
   <li className="flex items-start gap-3 text-sm">
     <span className="text-primary mt-0.5">{icon}</span>
     <span className="text-muted-foreground">{tip}</span>
