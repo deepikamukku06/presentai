@@ -2,84 +2,174 @@ import json
 import re
 from .llm_service import call_gemini
 
-def compare_script(reference_script, transcript):
-    """Compare a reference script against the actual transcript."""
+
+def compare_script(reference_script: str, transcript: str, gesture_score: float = 0, posture_score: float = 0, eye_contact_score: float = 0):
+    """
+    Compare a reference script against the actual transcript with delivery metrics.
+    Returns structured JSON with missing points, suggestions, and AI feedback.
+    """
 
     # Guard: if transcript is too short, skip Gemini call
     if not transcript or len(transcript.strip().split()) < 5:
         return {
             "coverage_percent": 0,
             "missing_points": ["Transcript too short to analyze"],
-            "partially_covered_points": [],
-            "flow_issues": [],
-            "insights": "The speaker did not say enough to compare against the script."
+            "content_suggestions": ["Speak more during your presentation"],
+            "AI_feedback_on_presentation": {
+                "encouragement": "Keep practicing your delivery.",
+                "improvement_tip": "Speak more to enable analysis."
+            }
         }
 
-    prompt = f"""You are an expert speech evaluator. Compare the reference script against what the speaker actually said in the transcript.
+    # Calculate coverage and missing points locally first
+    ref_words = set(reference_script.lower().split())
+    trans_words = set(transcript.lower().split())
+    common = ref_words & trans_words
+    coverage_percent = round((len(common) / max(len(ref_words), 1)) * 100, 1)
+    
+    # Find key phrases/sentences from script that may be missing
+    # Split script into sentences and check if key words appear in transcript
+    ref_sentences = [s.strip() for s in re.split(r'[.!?]', reference_script) if s.strip()]
+    transcript_lower = transcript.lower()
+    
+    missing_sentences = []
+    for sentence in ref_sentences:
+        sentence_words = set(sentence.lower().split())
+        # Remove common words
+        key_words = {w for w in sentence_words if len(w) > 4}
+        if key_words:
+            # Check how many key words appear in transcript
+            matches = sum(1 for w in key_words if w in transcript_lower)
+            if matches < len(key_words) * 0.3:  # Less than 30% of key words present
+                # Shorten to max 8 words
+                short = ' '.join(sentence.split()[:8])
+                if len(short) > 0:
+                    missing_sentences.append(short + ("..." if len(sentence.split()) > 8 else ""))
+    
+    # Limit to top 5 missing points
+    local_missing_points = missing_sentences[:5]
+    
+    # Generate local suggestions based on scores
+    local_suggestions = []
+    if gesture_score < 50:
+        local_suggestions.append("Use more hand gestures")
+    if posture_score < 50:
+        local_suggestions.append("Maintain better posture")
+    if eye_contact_score < 50:
+        local_suggestions.append("Increase eye contact")
+    if coverage_percent < 50:
+        local_suggestions.append("Cover more of your script")
+    
+    # Generate local feedback
+    avg_delivery = (gesture_score + posture_score + eye_contact_score) / 3
+    if avg_delivery >= 70:
+        local_encouragement = "Great delivery skills!"
+        local_tip = "Focus on content coverage."
+    elif avg_delivery >= 50:
+        local_encouragement = "Good effort overall."
+        local_tip = "Work on consistency."
+    else:
+        local_encouragement = "Keep practicing!"
+        local_tip = "Focus on confidence."
+
+    prompt = f"""You are an expert presentation evaluator.
+
+Compare the Reference Script and Actual Transcript strictly.
+
+Identify concepts present in the Reference Script that are missing or insufficiently explained in the Transcript.
+
+Use delivery scores only to generate short coaching feedback.
 
 Reference Script:
----
 {reference_script}
----
 
 Actual Transcript:
----
 {transcript}
----
 
-Analyze how well the speaker covered the script. Return ONLY a JSON object with NO markdown, NO code fences, NO extra text:
+Metrics:
+Coverage Score: {coverage_percent}
+Gesture Score: {gesture_score}
+Posture Score: {posture_score}
+Eye Contact Score: {eye_contact_score}
+
+Return ONLY valid JSON in this format:
 
 {{
-  "coverage_percent": <number 0-100>,
-  "missing_points": ["<key idea from script that was completely skipped>"],
-  "partially_covered_points": ["<idea that was mentioned but not fully explained>"],
-  "flow_issues": ["<any ordering or transition problems>"],
-  "insights": "<one paragraph summary of how well the speaker followed the script>"
+  "missing_points": [],
+  "content_suggestions": [],
+  "AI_feedback_on_presentation": {{
+    "encouragement": "",
+    "improvement_tip": ""
+  }}
 }}
 
 Rules:
-- coverage_percent: what percentage of the script's key ideas were conveyed
-- missing_points: list specific topics/sentences from the script that the speaker skipped entirely
-- partially_covered_points: ideas mentioned briefly but not fully covered
-- flow_issues: if the speaker changed the order or had awkward transitions
-- insights: a brief constructive summary
-- If the speaker covered everything well, set coverage_percent high and leave missing_points empty
-- Return ONLY valid JSON
+- Maximum 8 words per line.
+- No paragraphs.
+- No markdown.
+- No explanations.
+- Do not calculate scores.
+- Do not add extra keys.
+- If unable, return {{}}.
 """
 
     try:
-        result = call_gemini(prompt, max_tokens=1024, temperature=0)
+        result = call_gemini(prompt, max_tokens=512, temperature=0)
         parsed = _extract_json(result)
+        
         if parsed:
-            # Validate expected keys exist
-            parsed.setdefault("coverage_percent", 0)
-            parsed.setdefault("missing_points", [])
-            parsed.setdefault("partially_covered_points", [])
-            parsed.setdefault("flow_issues", [])
-            parsed.setdefault("insights", "")
+            # Add coverage_percent to the result
+            parsed["coverage_percent"] = coverage_percent
+            # Validate expected keys exist, merge with local analysis
+            if not parsed.get("missing_points"):
+                parsed["missing_points"] = local_missing_points
+            if not parsed.get("content_suggestions"):
+                parsed["content_suggestions"] = local_suggestions if local_suggestions else []
+            parsed.setdefault("AI_feedback_on_presentation", {
+                "encouragement": local_encouragement,
+                "improvement_tip": local_tip
+            })
             return parsed
         else:
-            print(f"⚠️ compare_script: Could not parse JSON from: {result[:300]}")
-            return {
-                "coverage_percent": 0,
-                "missing_points": ["Analysis could not be completed"],
-                "partially_covered_points": [],
-                "flow_issues": [],
-                "insights": "The AI model returned an invalid response. Please try again."
-            }
+            print(f"⚠️ compare_script: Could not parse JSON, using local analysis")
+            return _local_fallback(coverage_percent, local_missing_points, local_suggestions, local_encouragement, local_tip)
+            
     except Exception as e:
-        print(f"⚠️ compare_script exception: {e}")
-        return {
-            "coverage_percent": 0,
-            "missing_points": ["Analysis failed due to an error"],
-            "partially_covered_points": [],
-            "flow_issues": [],
-            "insights": str(e)
+        print(f"⚠️ compare_script exception: {e}, using local analysis")
+        return _local_fallback(coverage_percent, local_missing_points, local_suggestions, local_encouragement, local_tip)
+
+
+def _local_fallback(coverage_percent: float, missing_points: list, suggestions: list, encouragement: str, tip: str):
+    """Return local analysis results when Gemini fails."""
+    return {
+        "coverage_percent": coverage_percent,
+        "missing_points": missing_points,
+        "content_suggestions": suggestions if suggestions else ["Review your presentation delivery."],
+        "AI_feedback_on_presentation": {
+            "encouragement": encouragement,
+            "improvement_tip": tip
         }
+    }
+
+
+def _default_response(coverage_percent: float = 0):
+    """Return a safe default response when Gemini fails (no local data available)."""
+    return {
+        "coverage_percent": coverage_percent,
+        "missing_points": [],
+        "content_suggestions": ["Review your script coverage."],
+        "AI_feedback_on_presentation": {
+            "encouragement": "Keep practicing your delivery.",
+            "improvement_tip": "Focus on key talking points."
+        }
+    }
 
 
 def _extract_json(text: str):
     """Robustly extract a JSON object from text that may contain markdown fences."""
+    if not text:
+        return None
+        
     # Strip markdown code fences if present
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)

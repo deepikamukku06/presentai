@@ -1036,6 +1036,7 @@ running = False
 current_session_id = None
 current_user_id = None
 session_video_urls = {}
+gemini_cache = {}  # Cache Gemini results to avoid re-running on poll
 
 # ----------------------------
 # HELPER
@@ -1066,13 +1067,14 @@ def compute_overall(vision, filler_pct, pitch_stats):
 @app.post("/api/start")
 def start(user_id: int = 1, db: Session = Depends(get_db)):
 
-    global running, current_session_id, current_user_id
+    global running, current_session_id, current_user_id, gemini_cache
 
     if running:
         return {"status": "already running", "session_id": current_session_id}
 
     reset_scores()
     start_speech_system()
+    gemini_cache.clear()  # Clear cached Gemini results for new session
 
     session = SessionModel(
         user_id=user_id,
@@ -1126,17 +1128,202 @@ def receive_frame(payload: dict, db: Session = Depends(get_db)):
     return result
 
 # ----------------------------
-# STOP SESSION
+# STOP SESSION (Gemini runs in background thread)
 # ----------------------------
 
-@app.post("/api/stop")
-def stop():
+import threading
 
-    global running
+def run_gemini_analysis_background(session_id: int, user_id: int, transcript: str, 
+                                    reference_script_content: str, vision_scores: dict, 
+                                    pitch_stats: dict, filler_pct: float, speech_score: float, 
+                                    overall: float, fillers: list):
+    """
+    Run Gemini analysis in a background thread.
+    Saves results directly to database when complete.
+    """
+    global gemini_cache
+    
+    print(f"🤖 [Background] Starting Gemini analysis for session {session_id}...")
+    
+    # Build initial result
+    analysis_result = {
+        "transcript": transcript,
+        "fillers": fillers,
+        "filler_percent": filler_pct,
+        "pitch": pitch_stats,
+        "vision_scores": vision_scores,
+        "speech_score": speech_score,
+        "overall_score": overall,
+        "semantic_analysis": None,
+        "content_feedback": None,
+    }
+    
+    # Run semantic analysis
+    if reference_script_content and transcript and len(transcript.strip().split()) >= 5:
+        try:
+            semantic = compare_script(
+                reference_script_content,
+                transcript,
+                gesture_score=vision_scores.get("gesture", 0),
+                posture_score=vision_scores.get("posture", 0),
+                eye_contact_score=vision_scores.get("eye", 0)
+            )
+            analysis_result["semantic_analysis"] = semantic
+            print(f"✅ [Background] Semantic analysis complete")
+        except Exception as e:
+            print(f"⚠️ [Background] Semantic analysis error: {e}")
+            # Use default response on failure
+            analysis_result["semantic_analysis"] = {
+                "coverage_percent": 0,
+                "missing_points": [],
+                "content_suggestions": ["Analysis failed - try again later."],
+                "AI_feedback_on_presentation": {
+                    "encouragement": "Good effort on your presentation!",
+                    "improvement_tip": "Keep practicing your delivery."
+                }
+            }
+    
+    # Run content feedback
+    if transcript and len(transcript.strip().split()) >= 5:
+        try:
+            feedback = evaluate_content(transcript, pitch_stats, vision_scores)
+            if isinstance(feedback, dict) and "error" not in feedback:
+                analysis_result["content_feedback"] = feedback
+                print(f"✅ [Background] Content feedback complete")
+        except Exception as e:
+            print(f"⚠️ [Background] Content feedback error: {e}")
+            # Use default on failure
+            analysis_result["content_feedback"] = {
+                "overall_feedback": "Your presentation showed good effort.",
+                "key_strengths": ["Completed the presentation"],
+                "areas_for_improvement": ["Continue practicing"]
+            }
+    
+    # Save to database using a new session
+    try:
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+            if session:
+                session.analysis_json = analysis_result
+                db.commit()
+                print(f"✅ [Background] Session {session_id} analysis saved to database")
+            else:
+                print(f"⚠️ [Background] Session {session_id} not found in database")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"⚠️ [Background] Failed to save to database: {e}")
+    
+    # Also update cache for immediate access
+    gemini_cache["analysis_result"] = analysis_result
+    print(f"✅ [Background] Gemini analysis complete for session {session_id}")
+
+
+@app.post("/api/stop")
+def stop(user_id: int = 1, db: Session = Depends(get_db)):
+    """
+    Stop the presentation session and start Gemini analysis in background.
+    Returns immediately - report endpoint polls until analysis is ready.
+    """
+    global running, current_session_id, gemini_cache
+
     stop_speech_system()
     running = False
 
-    return {"status": "stopped"}
+    # Get transcript and metrics
+    transcript = get_full_transcript()
+    pitch_stats = get_pitch_stats()
+    vision_scores = compute_scores()
+
+    filler_count = len(speech_state.get("fillers", []))
+    total_words = max(len(transcript.split()) if transcript else 1, 1)
+    filler_pct = round((filler_count / total_words) * 100, 2)
+
+    speech_score, overall = compute_overall(vision_scores, filler_pct, pitch_stats)
+
+    # Get reference script content
+    reference_script = db.query(Script).filter(
+        Script.user_id == user_id,
+        Script.is_final == True
+    ).order_by(Script.created_at.desc()).first()
+    
+    reference_script_content = reference_script.content if reference_script else None
+
+    # Save basic session data immediately (without Gemini results)
+    if current_session_id:
+        session = db.query(SessionModel).filter(
+            SessionModel.id == current_session_id
+        ).first()
+
+        if session:
+            session.gesture_score = vision_scores["gesture"]
+            session.posture_score = vision_scores["posture"]
+            session.eye_score = vision_scores["eye"]
+            session.speech_score = speech_score
+            session.overall_score = overall
+            session.transcript = transcript
+            session.video_url = session_video_urls.get(current_session_id)
+            # analysis_json will be set by background thread
+            
+            if reference_script:
+                session.reference_script_id = reference_script.id
+
+            db.commit()
+            print(f"✅ Session {current_session_id} basic data saved")
+
+        # Update mastery
+        update_mastery(db, user_id)
+
+    # Start Gemini analysis in background thread
+    if transcript and len(transcript.strip().split()) >= 5:
+        thread = threading.Thread(
+            target=run_gemini_analysis_background,
+            args=(
+                current_session_id,
+                user_id,
+                transcript,
+                reference_script_content,
+                vision_scores,
+                pitch_stats,
+                filler_pct,
+                speech_score,
+                overall,
+                speech_state.get("fillers", [])
+            ),
+            daemon=True
+        )
+        thread.start()
+        print(f"🚀 Gemini analysis started in background thread")
+    else:
+        print(f"⏭️ Skipping Gemini analysis - transcript too short")
+        # Set default analysis for short transcripts
+        gemini_cache["analysis_result"] = {
+            "transcript": transcript,
+            "fillers": speech_state.get("fillers", []),
+            "filler_percent": filler_pct,
+            "pitch": pitch_stats,
+            "vision_scores": vision_scores,
+            "speech_score": speech_score,
+            "overall_score": overall,
+            "semantic_analysis": {
+                "coverage_percent": 0,
+                "missing_points": ["Transcript too short to analyze"],
+                "content_suggestions": [],
+                "AI_feedback_on_presentation": {
+                    "encouragement": "Keep practicing!",
+                    "improvement_tip": "Speak more to enable analysis."
+                }
+            },
+            "content_feedback": {
+                "overall_feedback": "Transcript was too short for detailed analysis.",
+                "key_strengths": [],
+                "areas_for_improvement": ["Speak longer for full analysis"]
+            }
+        }
+
+    return {"status": "stopped", "session_id": current_session_id}
 
 # ----------------------------
 # LIVE TRANSCRIPTS
@@ -1215,7 +1402,7 @@ async def upload_video_file(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"video_url": None, "error": str(e)})
 
 # ----------------------------
-# FINAL SESSION REPORT
+# FINAL SESSION REPORT (READ-ONLY - No Gemini calls)
 # ----------------------------
 
 @app.get("/api/session/report")
@@ -1223,90 +1410,83 @@ def session_report(
     user_id: int,
     db: Session = Depends(get_db)
 ):
-    global current_session_id
+    """
+    Returns stored analysis from database.
+    Gemini was already called in /api/stop - this is READ-ONLY.
+    """
+    global current_session_id, gemini_cache
 
-    transcript = get_full_transcript()
-
-    filler_count = len(speech_state["fillers"])
-    total_words = max(len(transcript.split()), 1)
-    filler_pct = round((filler_count / total_words) * 100, 2)
-
-    vision_scores = compute_scores()
-    pitch_stats = get_pitch_stats()
-
-    # 🔥 GET FINALIZED SCRIPT
-    reference_script = db.query(Script).filter(
-        Script.user_id == user_id,
-        Script.is_final == True
-    ).order_by(Script.created_at.desc()).first()
-
-    semantic_analysis = None
-    content_feedback = None
-
-    # Run both Gemini calls in parallel using threads
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def _compare():
-        if reference_script:
-            return compare_script(reference_script.content, transcript)
-        return None
-
-    def _evaluate():
-        try:
-            fb = evaluate_content(transcript, pitch_stats, vision_scores)
-            if isinstance(fb, dict) and "error" in fb:
-                print(f"⚠️ Gemini feedback error: {fb}")
-                return None
-            return fb
-        except Exception as e:
-            print(f"⚠️ Gemini feedback exception: {e}")
-            return None
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_compare = pool.submit(_compare)
-        future_evaluate = pool.submit(_evaluate)
-        semantic_analysis = future_compare.result(timeout=90)
-        content_feedback = future_evaluate.result(timeout=90)
-
-    speech_score, overall = compute_overall(
-        vision_scores,
-        filler_pct,
-        pitch_stats,
-    )
-
-    # 🔥 UPDATE SESSION
+    # Try to get from database first
+    session = None
     if current_session_id:
         session = db.query(SessionModel).filter(
             SessionModel.id == current_session_id
         ).first()
 
-        if session:
-            session.gesture_score = vision_scores["gesture"]
-            session.posture_score = vision_scores["posture"]
-            session.eye_score = vision_scores["eye"]
-            session.speech_score = speech_score
-            session.overall_score = overall
-            session.transcript = transcript
+    # If we have stored analysis_json, use it
+    if session and session.analysis_json:
+        stored = session.analysis_json
+        print(f"📖 Report: Returning stored analysis from database")
+        return {
+            "transcript": stored.get("transcript", session.transcript or ""),
+            "vision_scores": stored.get("vision_scores", {
+                "gesture": session.gesture_score,
+                "posture": session.posture_score,
+                "eye": session.eye_score,
+                "overall": session.overall_score
+            }),
+            "speech_score": stored.get("speech_score", session.speech_score),
+            "overall_score": stored.get("overall_score", session.overall_score),
+            "semantic_analysis": stored.get("semantic_analysis"),
+            "content_feedback": stored.get("content_feedback"),
+            "filler_percent": stored.get("filler_percent", 0),
+            "pitch": stored.get("pitch", {"avg": 0, "min": 0, "max": 0}),
+            "fillers": stored.get("fillers", []),
+            "video_url": session.video_url or session_video_urls.get(current_session_id),
+        }
 
-            if reference_script:
-                session.reference_script_id = reference_script.id
+    # Fallback to gemini_cache (for immediate access after stop)
+    cached = gemini_cache.get("analysis_result")
+    if cached:
+        print(f"📖 Report: Returning cached analysis")
+        return {
+            "transcript": cached.get("transcript", ""),
+            "vision_scores": cached.get("vision_scores", {}),
+            "speech_score": cached.get("speech_score", 0),
+            "overall_score": cached.get("overall_score", 0),
+            "semantic_analysis": cached.get("semantic_analysis"),
+            "content_feedback": cached.get("content_feedback"),
+            "filler_percent": cached.get("filler_percent", 0),
+            "pitch": cached.get("pitch", {}),
+            "fillers": cached.get("fillers", []),
+            "video_url": session_video_urls.get(current_session_id) if session else None,
+        }
 
-            session.analysis_json = semantic_analysis
-
-            db.commit()
-
-    update_mastery(db, user_id)
+    # If no stored data yet (analysis still processing), return partial data
+    print(f"⏳ Report: Analysis not yet complete, returning partial data")
+    
+    # Get live data as fallback
+    transcript = get_full_transcript()
+    vision_scores = compute_scores()
+    pitch_stats = get_pitch_stats()
+    
+    filler_count = len(speech_state.get("fillers", []))
+    total_words = max(len(transcript.split()) if transcript else 1, 1)
+    filler_pct = round((filler_count / total_words) * 100, 2)
+    
+    speech_score, overall = compute_overall(vision_scores, filler_pct, pitch_stats)
 
     return {
         "transcript": transcript,
         "vision_scores": vision_scores,
         "speech_score": speech_score,
         "overall_score": overall,
-        "semantic_analysis": semantic_analysis,
-        "content_feedback": content_feedback,
+        "semantic_analysis": None,  # Not ready yet
+        "content_feedback": None,   # Not ready yet
         "filler_percent": filler_pct,
         "pitch": pitch_stats,
-        "fillers": speech_state["fillers"],
+        "fillers": speech_state.get("fillers", []),
+        "video_url": session_video_urls.get(current_session_id),
     }
 
 # ----------------------------
